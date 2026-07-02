@@ -5,42 +5,43 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 ```bash
-npm run dev           # Start dev server at http://localhost:3000/lol-hub
-npm run dev:clean     # Remove .next then start dev server (use after failed build)
-npm run build         # Static export → out/
+npm run dev           # Start dev server at http://localhost:3000/lol-hub (auto-cleans .next)
+npm run build         # Static export → out/ (auto-cleans .next)
 npm run lint          # ESLint check
-npm run proxy         # Legacy: local OP.GG MCP proxy on port 8787 (not used by app)
+npm run export        # Preview static export locally (npx serve out)
 ```
 
 ## Rules
 
-- **Never run `npm run build` while dev server is running.** Produces "Cannot find module './948.js'" errors.
 - **Never include `Co-Authored-By: Claude` or any Claude/AI attribution in git commits.**
-- **Splash art paths in `cdn.ts` must be relative (no leading `/`).** Root-relative paths like `/splash/x.jpg` break on GitHub Pages because the site is served at `/lol-hub/`, not `/`. Always write `splash/x.jpg`.
+- **Splash art paths in `cdn.ts` must be relative (no leading `/`).** Root-relative paths like `/splash/x.jpg` break on GitHub Pages because the site is served at `/lol-hub/`, not `/`. Always write `splash/x.jpg`. The `getSplashUrl()` function now strips accidental leading slashes defensively.
 - **Never develop without knowing the user's proxy: `http://127.0.0.1:7897`.** Configure git with `http.proxy` and `https.proxy` pointing there.
+- **All DDragon/CommunityDragon image URLs must go through `src/lib/cdn.ts`.** Never inline `https://ddragon.leagueoflegends.com/...` strings in components. Use the exported functions: `getDdragonSplashUrl`, `getDdragonLoadingUrl`, `getDdragonIconUrl`, `getCommunityDragonChromaUrl`, `getSplashUrl`.
 
 ## Architecture
 
 **Next.js 14 App Router + static export** (`output: "export"`, `basePath: "/lol-hub"` in next.config.mjs). Single HTML file with hash-based client-side SPA. Images use `unoptimized: true`.
 
-### Routing (hash-based SPA)
+### Routing (hash-based SPA with code splitting)
 
-`src/app/page.tsx` is the single entry point. All views via URL hash:
+`src/app/page.tsx` is the single entry point. All page components are **lazy-loaded via `next/dynamic`** with `ssr: false` — each navigation triggers a new JS chunk fetch on first visit. Each route view is wrapped in `<ErrorBoundary>` to isolate crashes.
 
-| Hash | View |
-|------|------|
-| `#/` | Hero list |
-| `#/hero/{id}` | Hero detail (skin gallery) |
-| `#/compare` | Skin comparison |
-| `#/analytics` | OP.GG champion tier list |
-| `#/analytics/{id}` | Champion analysis detail |
+| Hash | View | Component |
+|------|------|-----------|
+| `#/` | Hero list | `HeroList` |
+| `#/hero/{id}` | Hero detail (skin gallery) | `HeroDetail` |
+| `#/compare` | Skin comparison | `ComparePage` |
+| `#/analytics` | OP.GG champion tier list | `AnalyticsList` |
+| `#/analytics/{id}` | Champion analysis detail | `AnalyticsDetail` |
 
-`navigate("/", { home: true })` returns to the landing page (`entered=false`). `navigate("/")` (no opts) goes to hero list. `entered` state controls landing vs. app.
+`hashToRoute()` uses regex matching and normalizes trailing slashes, double-hashes, and missing leading `#`. Deep-linking (e.g. bookmarking `#/hero/Aatrox`) skips the landing page — `entered` initializes to `true` when the hash is a non-empty deep link.
+
+`navigate("/", { home: true })` returns to the landing page (`entered=false`). `navigate("/")` (no opts) goes to hero list. Landing → app transition only happens via the "进入预览" button.
 
 ### Data sources
 
 - **Data Dragon** (`ddragon.leagueoflegends.com`) — champion list, skins, splash/loading art, runes, items, spells. All calls cached 1h in sessionStorage (`ddragon:*` keys).
-- **CommunityDragon** (`raw.communitydragon.org`) — chroma variant images. Used as tier-2 fallback when Data Dragon lacks chroma splash art.
+- **CommunityDragon** (`raw.communitydragon.org`) — chroma variant images. Used as tier-1 fallback when Data Dragon lacks chroma splash art.
 - **OP.GG REST API** (`lol-api-champion.op.gg`) — champion analytics: win/pick/ban rates, runes, builds, counters. CORS enabled, no auth needed. `src/lib/opgg.ts` wraps it. URL pattern: `/api/{region}/champions/{mode}/{id}/{position}?version=16.X&tier=...`. Cached 30min in sessionStorage (`opgg:*` keys).
 - **Local splash art** — `public/splash/` contains 173 champion default splash JPEGs downloaded via `scripts/download-splashes.mjs`. `src/lib/cdn.ts` → `getSplashUrl()` maps to `splash/{id}.jpg` (relative path — see Rules).
 
@@ -51,16 +52,24 @@ Two-tier caching to avoid rate limiting and speed up repeat visits:
 - **Data Dragon** (`src/lib/api.ts`): 1-hour TTL. Keys: `ddragon:version`, `ddragon:champions:{ver}`, `ddragon:champion:{ver}:{id}`, `ddragon:runes:{ver}`, `ddragon:items:{ver}`, `ddragon:spells:{ver}`.
 - **OP.GG** (`src/lib/opgg.ts`): 30-minute TTL. Keys: `opgg:versionShort`, `opgg:champs:{region}:{mode}:{tier}`, `opgg:detail:{region}:{mode}:{tier}:{id}:{pos}`.
 
-Data evicted on expiry on next access. `fetchVersions()` has an additional in-memory cache (`cachedVersion`) that never expires within a session.
+**`fetchVersions()` deduplication:** Concurrent calls share a single in-flight `versionPromise` — only one HTTP request to DDragon even when multiple components mount simultaneously. The promise resets to `null` on resolution.
 
-### Image loading (SkinCard + SkinViewer)
+### Image loading & fallback
 
-Three-tier fallback: `errorLevel` 0→1→2
-1. ddragon splash/loading URL
-2. CommunityDragon chroma image (preloaded via `new window.Image()`)
-3. Nearest chroma-base skin (via `getFallbackSkinNum` in `src/lib/utils.ts`)
+**URL centralization:** All DDragon and CommunityDragon URLs are constructed in `src/lib/cdn.ts` — components never inline URL strings. Five exported functions cover every image source.
 
-SkinCard remounts on mode change via `key={`${skinId}-${viewMode}`}`. Chroma images use `object-contain` within `aspect-[16/9]` containers to avoid size inconsistency.
+**Three-tier fallback** in `SkinCard` and `SkinViewer`:
+1. DDragon splash/loading URL (`errorLevel=0`)
+2. CommunityDragon chroma image (`errorLevel=1`)
+3. Nearest chroma-base skin via `buildFallbackMap()` in `src/lib/utils.ts` (`errorLevel=2`)
+
+`SkinCard` uses an **IntersectionObserver** (`useInView` hook) to preload chroma/fallback images only when the card is within 200px of the viewport — avoids 80+ hidden preload requests on large pages.
+
+**Mode switching:** `SkinCard`'s outer wrapper uses `key={skin.id}` (stable across splash/loading mode changes). The inner `<Image>` uses `key={`${errorLevel}-${mode}`}` for targeted remounts — switching modes no longer unmounts the entire card.
+
+**HeroDetail precomputation:** `useMemo` precomputes all skin URLs and the `buildFallbackMap()` once per champion, avoiding O(skins²) recomputation on every render.
+
+**Error handling:** `ComparePage`, `HeroCard`, and both banner components (`HeroDetail`, `AnalyticsDetail`) now have `onError` handlers with fallback URLs (DDragon CDN or champion square icon).
 
 ### Analytics page
 
@@ -70,22 +79,21 @@ SkinCard remounts on mode change via `key={`${skinId}-${viewMode}`}`. Chroma ima
 
 ### Shared utilities
 
-`src/lib/utils.ts` — `getComparePool()`, `saveComparePool()` (localStorage key `"comparePool"`), `getFallbackSkinNum()`.
+`src/lib/utils.ts` — `getComparePool()`, `saveComparePool()` (localStorage key `"comparePool"`), `getFallbackSkinNum()`, `buildFallbackMap()`.
 
 ### Canvas background
 
 `HextechBackground.tsx` — rAF loop: hex grid, crystal nodes, pulse rings, floating particles. `window.__hextechSurge()` triggers energy burst on landing entry.
 
+### Error boundary
+
+`ErrorBoundary.tsx` — React class component wrapping each route view in `page.tsx`. Catches unhandled render errors, displays a friendly fallback UI with a "返回首页" button. Uses `key={route.id}` to reset on navigation between different items of the same page type.
+
 ### GitHub Pages SPA fallback
 
-Three files ensure client-side routing works on GitHub Pages:
 - **`_redirects`** — `/* /index.html 200` catches all paths → SPA (primary mechanism).
 - **`404.html`** — Copy of `index.html` with SPA bootstrap; fallback for paths where `_redirects` doesn't fire.
-- **`index.txt`** — Empty file; forces GitHub Pages to skip Jekyll processing (alternative to `.nojekyll`).
-
-### Worker directory (legacy)
-
-`worker/` contains a Cloudflare Worker (`opgg-proxy.js` + `wrangler.toml`) and a local Node.js proxy (`dev-proxy.mjs`, port 8787) that both wrap OP.GG's MCP API (JSON-RPC at `mcp-api.op.gg`). **Neither is used in production** — the app talks to OP.GG's REST API (`lol-api-champion.op.gg`) directly from the browser. These files remain from the initial MCP exploration and can be safely ignored or deleted.
+- **`.nojekyll`** — Forces GitHub Pages to skip Jekyll processing (auto-generated in CI via `deploy.yml`).
 
 ### Design tokens
 
@@ -94,18 +102,4 @@ Three files ensure client-side routing works on GitHub Pages:
 
 ## Deployment
 
-GitHub Pages from `gh-pages` branch. Steps:
-
-```bash
-npm run build
-cd out
-git init && git config user.name "ivor-y" && git config user.email "y858596300@gmail.com"
-git config http.proxy http://127.0.0.1:7897 && git config https.proxy http://127.0.0.1:7897
-git config http.sslVerify false
-touch .nojekyll   # CRITICAL: prevents Jekyll from stripping _next/
-git add -A && git commit -m "Deploy"
-git remote add origin https://github.com/ivor-y/lol-hub.git
-git push -f origin HEAD:gh-pages
-```
-
-Source on `main` branch. Site at `https://ivor-y.github.io/lol-hub/`.
+GitHub Pages via CI (`.github/workflows/deploy.yml`). On push to `main`: `npm ci` → `npm run build` → `touch ./out/.nojekyll` → upload artifact → deploy. Site at `https://ivor-y.github.io/lol-hub/`.
